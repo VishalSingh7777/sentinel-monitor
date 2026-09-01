@@ -1,0 +1,243 @@
+
+import { NormalizedMarketTick, Trade } from '../types';
+
+export class BinanceService {
+  private tradeWS: WebSocket | null = null;
+  private depthWS: WebSocket | null = null;
+  private tickerWS: WebSocket | null = null;
+  
+  private lastPrice = 0;
+  private volume24h = 0;
+  private bids: [number, number][] = [];
+  private asks: [number, number][] = [];
+  private recentTrades: Trade[] = [];
+  // Dynamic large-trade threshold — adapts to actual trade-size distribution.
+  // Recalculated each tick as the 90th percentile of recent trade sizes.
+  // At BTC=$95k: typical trades are 0.01-0.1 BTC; genuine blocks are 0.5-5 BTC.
+  // Fixed 0.5 BTC threshold was calibrated at an older, lower BTC price.
+  // With a dynamic threshold, "large" always means top-10% of current activity.
+  private tradeSizeHistory: number[] = []; // rolling 200-trade window
+  // FIX [E]: Staleness detection. Binance book and trade streams are independent
+  // WebSocket connections. During flash crashes or high load, depth updates
+  // can lag behind trade stream. We track last update time for each stream
+  // separately so emitTick can flag stale data_quality honestly.
+  private lastDepthUpdateMs  = 0;
+  private lastTradeUpdateMs  = 0;
+  
+  private lastExchangeTime = 0;
+  private lastReceivedTime = 0;
+  private clockOffset = 0; // Difference between Binance server time and local time
+  
+  private onTickCallback: (tick: NormalizedMarketTick) => void;
+  private intervalId: any = null;
+
+  // Use the recommended port 9443 for better stability
+  private readonly WS_BASE_URL = 'wss://stream.binance.com:9443/ws';
+
+  constructor(onTick: (tick: NormalizedMarketTick) => void) {
+    this.onTickCallback = onTick;
+  }
+
+  /**
+   * Synchronizes the local clock with Binance server time to ensure
+   * latency calculations (received_timestamp - exchange_timestamp) are accurate.
+   */
+  private async syncClock(): Promise<void> {
+    try {
+      const start = Date.now();
+      const response = await fetch('https://api.binance.com/api/v3/time');
+      if (!response.ok) throw new Error('Time sync failed');
+      const end = Date.now();
+      const data = await response.json();
+      
+      // Calculate Round Trip Time (RTT) to estimate one-way latency
+      const rtt = (end - start) / 2;
+      // offset = serverTime - (localTimeAtServerArrival)
+      this.clockOffset = data.serverTime - (end - rtt);
+      
+      console.log(`[Binance] Clock Synchronized. Offset: ${this.clockOffset}ms`);
+    } catch (err) {
+      console.warn('[Binance] Clock sync failed, falling back to local time. Latency display may be inaccurate.');
+      this.clockOffset = 0;
+    }
+  }
+
+  async start(): Promise<void> {
+    console.log('[Binance] Initializing High-Speed Pipeline...');
+    
+    // Perform clock sync before starting streams
+    await this.syncClock();
+    
+    this.connectTrades();
+    this.connectDepth();
+    this.connectTicker();
+    
+    if (this.intervalId) clearInterval(this.intervalId);
+    
+    // Increased frequency from 1000ms to 100ms for institutional-grade responsiveness
+    this.intervalId = setInterval(() => {
+      this.emitTick();
+    }, 100);
+  }
+
+  stop(): void {
+    console.log('[Binance] Stopping Live Feed...');
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+    this.tradeSizeHistory  = [];
+    this.lastDepthUpdateMs  = 0;
+    this.lastTradeUpdateMs  = 0;
+    this.closeSockets();
+  }
+
+  private closeSockets(): void {
+    [this.tradeWS, this.depthWS, this.tickerWS].forEach(ws => {
+      if (ws) {
+        ws.onclose = null; 
+        ws.onerror = null;
+        ws.close();
+      }
+    });
+    this.tradeWS = null;
+    this.depthWS = null;
+    this.tickerWS = null;
+  }
+
+  private connectTrades(): void {
+    this.tradeWS = new WebSocket(`${this.WS_BASE_URL}/btcusdt@aggTrade`);
+    this.tradeWS.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.E) {
+        this.lastExchangeTime = data.E;
+        this.lastReceivedTime = Date.now();
+      }
+
+      const trade: Trade = {
+        id: data.a,
+        price: parseFloat(data.p),
+        quantity: parseFloat(data.q),
+        timestamp: data.T,
+        side: data.m ? 'sell' : 'buy'
+      };
+      this.lastPrice = trade.price;
+      this.recentTrades.push(trade);
+      this.lastTradeUpdateMs = Date.now(); // FIX [E]
+      
+      // Prevent memory overflow on extreme volatility
+      if (this.recentTrades.length > 5000) this.recentTrades.splice(0, 1000);
+    };
+    
+    this.tradeWS.onclose = () => {
+      if (this.intervalId) {
+        setTimeout(() => this.connectTrades(), 3000);
+      }
+    };
+  }
+
+  private connectDepth(): void {
+    // 100ms depth updates are essential for microstructure analysis
+    this.depthWS = new WebSocket(`${this.WS_BASE_URL}/btcusdt@depth20@100ms`);
+    this.depthWS.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      this.bids = data.bids.map((b: any) => [parseFloat(b[0]), parseFloat(b[1])]);
+      this.asks = data.asks.map((a: any) => [parseFloat(a[0]), parseFloat(a[1])]);
+      this.lastDepthUpdateMs = Date.now(); // FIX [E]: stamp every real depth update
+    };
+    this.depthWS.onclose = () => {
+      if (this.intervalId) setTimeout(() => this.connectDepth(), 3000);
+    };
+  }
+
+  private connectTicker(): void {
+    this.tickerWS = new WebSocket(`${this.WS_BASE_URL}/btcusdt@ticker`);
+    this.tickerWS.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      this.volume24h = parseFloat(data.v);
+    };
+    this.tickerWS.onclose = () => {
+      if (this.intervalId) setTimeout(() => this.connectTicker(), 3000);
+    };
+  }
+
+  private emitTick(): void {
+    if (this.lastPrice === 0 || this.bids.length === 0 || this.asks.length === 0) {
+      return;
+    }
+
+    const buyTrades  = this.recentTrades.filter(t => t.side === 'buy');
+    const sellTrades = this.recentTrades.filter(t => t.side === 'sell');
+
+    // Update rolling trade size history (keep last 200 trades for percentile calc)
+    this.recentTrades.forEach(t => this.tradeSizeHistory.push(t.quantity));
+    if (this.tradeSizeHistory.length > 200) {
+      this.tradeSizeHistory = this.tradeSizeHistory.slice(-200);
+    }
+
+    // Dynamic large-trade threshold: 90th percentile of recent trade sizes.
+    // Falls back to 0.5 BTC minimum so signal doesn't trigger on micro-trades
+    // during low-activity sessions when the 90th pct might be tiny.
+    const largeThreshold = (() => {
+      if (this.tradeSizeHistory.length < 10) return 0.5;
+      const sorted  = [...this.tradeSizeHistory].sort((a, b) => a - b);
+      const p90idx  = Math.floor(sorted.length * 0.90);
+      const p90     = sorted[p90idx] ?? 0.5;
+      // Ensure threshold is meaningful: at least 0.5 BTC so we only catch real blocks
+      return Math.max(0.5, p90);
+    })();
+
+    const calculateVWAP = (levels: [number, number][]) => {
+      let valueSum = 0;
+      let weightSum = 0;
+      for (const [p, q] of levels) {
+        valueSum += p * q;
+        weightSum += q;
+      }
+      return weightSum > 0 ? valueSum / weightSum : 0;
+    };
+
+    const bidVWAP = calculateVWAP(this.bids) || this.bids[0][0];
+    const askVWAP = calculateVWAP(this.asks) || this.asks[0][0];
+    
+    const effectiveSpread = askVWAP - bidVWAP;
+    const midPrice = (this.bids[0][0] + this.asks[0][0]) / 2;
+    const spreadBps = (effectiveSpread / midPrice) * 10000;
+
+    const tick: NormalizedMarketTick = {
+      exchange_timestamp: this.lastExchangeTime,
+      // Apply clock offset to local arrival time for accurate latency calculation
+      received_timestamp: this.lastReceivedTime + this.clockOffset,
+      processing_timestamp: Date.now() + this.clockOffset,
+      price: this.lastPrice,
+      volume_24h: this.volume24h,
+      bids: this.bids,
+      asks: this.asks,
+      trades: {
+        buy_volume: buyTrades.reduce((s, t) => s + t.quantity, 0),
+        sell_volume: sellTrades.reduce((s, t) => s + t.quantity, 0),
+        buy_count: buyTrades.length,
+        sell_count: sellTrades.length,
+        large_trades: this.recentTrades.filter(t => t.quantity >= largeThreshold)
+      },
+      mid_price: midPrice,
+      spread: this.asks[0][0] - this.bids[0][0],
+      spread_bps: spreadBps,
+      total_depth: this.bids.reduce((s, b) => s + b[1], 0) + this.asks.reduce((s, a) => s + a[1], 0),
+      is_valid: true,
+      // FIX [E]: Detect staleness honestly instead of hardcoding 'GOOD'.
+      // STALE: depth snapshot not refreshed in 2s (Binance high-load lag).
+      // DEGRADED: trade stream silent 3s+ (unusual — possible feed issue).
+      // GOOD: both streams recently updated.
+      data_quality: (() => {
+        const now = Date.now();
+        if (this.lastDepthUpdateMs > 0 && (now - this.lastDepthUpdateMs) > 2_000) return 'STALE';
+        if (this.lastTradeUpdateMs > 0 && (now - this.lastTradeUpdateMs) > 3_000) return 'DEGRADED';
+        return 'GOOD';
+      })() as 'GOOD' | 'DEGRADED' | 'STALE'
+    };
+
+    this.onTickCallback(tick);
+    this.recentTrades = []; 
+  }
+}
